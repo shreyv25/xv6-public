@@ -1,3 +1,10 @@
+	// Segments in proc->gdt.	
+#define NSEGS     7	
+#define MAX_PSYC_PAGES 15	
+#define MAX_TOTAL_PAGES 30	
+
+
+
 // Per-CPU state
 struct cpu {
   uchar apicid;                // Local APIC ID
@@ -8,10 +15,27 @@ struct cpu {
   int ncli;                    // Depth of pushcli nesting.
   int intena;                  // Were interrupts enabled before pushcli?
   struct proc *proc;           // The process running on this cpu or null
+  
+  // Cpu-local storage variables; see below	
+  struct cpu *cpu;	
+  //struct proc *proc;           // The currently-running process.
 };
 
 extern struct cpu cpus[NCPU];
 extern int ncpu;
+
+
+	
+// Per-CPU variables, holding pointers to the	
+// current cpu and to the current process.	
+// The asm suffix tells gcc to use "%gs:0" to refer to cpu	
+// and "%gs:4" to refer to proc.  seginit sets up the	
+// %gs segment register so that %gs refers to the memory	
+// holding those two variables in the local cpu's struct cpu.	
+// This is similar to how thread-local variables are implemented	
+// in thread libraries such as Linux pthreads.	
+extern struct cpu *cpu asm("%gs:0");       // &cpus[cpunum()]	
+extern struct proc *proc asm("%gs:4");     // cpus[cpunum()].proc
 
 //PAGEBREAK: 17
 // Saved registers for kernel context switches.
@@ -34,6 +58,21 @@ struct context {
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+
+		
+struct pgdesc {	
+  uint swaploc;	
+  int age;	
+  char *va;	
+};	
+struct freepg {	
+  char *va;	
+  int age;	
+  struct freepg *next;	
+  struct freepg *prev;	
+};	
+
+
 // Per-process state
 struct proc {
   uint sz;                     // Size of process memory (bytes)
@@ -49,7 +88,19 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  uint oldsz;                  // size before allocation in lazy allocation
+  
+  	
+  //Swap file. must initiate with create swap file	
+  struct file *swapFile;			//page file	
+  int pagesinmem;             // No. of pages in physical memory	
+  int pagesinswapfile;        // No. of pages in swap file	
+  int totalPageFaultCount;    // Total number of page faults for this process	
+  int totalPagedOutCount;     // Total number of pages that were placed in the swap file	
+  struct freepg freepages[MAX_PSYC_PAGES];  // Pre-allocated space for the pages in physical memory linked list	
+  struct pgdesc swappedpages[MAX_PSYC_PAGES];// Pre-allocated space for the pages in swap file array	
+  struct freepg *head;        // Head of the pages in physical memory linked list	
+  struct freepg *tail;        // End of the pages in physical memory linked list
+  
 };
 
 // Process memory is laid out contiguously, low addresses first:

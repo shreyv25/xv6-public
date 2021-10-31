@@ -29,9 +29,6 @@
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
-
-  // Linked list of all buffers, through prev/next.
-  // head.next is most recently used.
   struct buf head;
 } bcache;
 
@@ -39,10 +36,8 @@ void
 binit(void)
 {
   struct buf *b;
-
   initlock(&bcache.lock, "bcache");
 
-//PAGEBREAK!
   // Create linked list of buffers
   bcache.head.prev = &bcache.head;
   bcache.head.next = &bcache.head;
@@ -62,7 +57,6 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
-
   acquire(&bcache.lock);
 
   // Is the block already cached?
@@ -92,6 +86,46 @@ bget(uint dev, uint blockno)
   panic("bget: no buffers");
 }
 
+// Write 4096 bytes pg to the eight consecutive starting at blk. 
+void
+write_page_to_disk(uint dev, char *pg, uint blk)
+{
+  struct buf* buffer;
+  int blockno = 0;
+  int ithPartOfPage = 0;        // which part of page (out of 8) is to be written to disk
+  for(int i=0;i<8;i++)
+  {
+    // for atomicity, the block must be written to the disk
+    ithPartOfPage = i*512;
+    blockno = blk+i;
+    buffer = bget(ROOTDEV,blockno);
+    /*
+      Writing physical page to disk by dividing it into 8 pieces (4096 bytes/8 = 512 bytes = 1 block)
+      As one page requires 8 disk blocks
+    */
+    memmove(buffer->data,pg+ithPartOfPage,512);   // write 512 bytes to the block
+    bwrite(buffer);
+    brelse(buffer);                               //release lock
+  }
+}
+
+// Read 4096 bytes from the eight consecutive starting at blk into pg.
+void
+read_page_from_disk(uint dev, char *pg, uint blk)
+{
+  struct buf* buffer;
+  int blockno=0;
+  int ithPartOfPage=0;
+  for(int i=0;i<8;i++){
+    ithPartOfPage=i*512;
+    blockno=blk+i;
+    buffer=bread(ROOTDEV,blockno);                // if present in buffer, returns from buffer else from disk
+    memmove(pg+ithPartOfPage, buffer->data,512);  // write to pg from buffer
+    brelse(buffer);                               // release lock
+  }
+
+}
+
 // Return a locked buf with the contents of the indicated block.
 struct buf*
 bread(uint dev, uint blockno)
@@ -105,7 +139,7 @@ bread(uint dev, uint blockno)
   return b;
 }
 
-// Write b's contents to disk.  Must be locked.
+// Write b's contents to disk. Must be locked.
 void
 bwrite(struct buf *b)
 {
@@ -128,7 +162,6 @@ brelse(struct buf *b)
   acquire(&bcache.lock);
   b->refcnt--;
   if (b->refcnt == 0) {
-    // no one is waiting for it.
     b->next->prev = b->prev;
     b->prev->next = b->next;
     b->next = bcache.head.next;
@@ -136,9 +169,6 @@ brelse(struct buf *b)
     bcache.head.next->prev = b;
     bcache.head.next = b;
   }
-  
+
   release(&bcache.lock);
 }
-//PAGEBREAK!
-// Blank page.
-

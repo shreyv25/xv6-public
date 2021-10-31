@@ -6,6 +6,8 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "paging.h"
+#include "fs.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -57,7 +59,7 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa. va and size might not
 // be page-aligned.
-int
+static int
 mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
 {
   char *a, *last;
@@ -69,7 +71,7 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
     if((pte = walkpgdir(pgdir, a, 1)) == 0)
       return -1;
     if(*pte & PTE_P)
-      panic("remap");
+      panic("remap in mappages in vm.c");
     *pte = pa | perm | PTE_P;
     if(a == last)
       break;
@@ -230,16 +232,17 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
     return oldsz;
 
   a = PGROUNDUP(oldsz);
+
   for(; a < newsz; a += PGSIZE){
     mem = kalloc();
     if(mem == 0){
-      cprintf("allocuvm out of memory\n");
+      //cprintf("allocuvm out of memory\n");
       deallocuvm(pgdir, newsz, oldsz);
       return 0;
     }
     memset(mem, 0, PGSIZE);
     if(mappages(pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0){
-      cprintf("allocuvm out of memory (2)\n");
+      //cprintf("allocuvm out of memory (2)\n");
       deallocuvm(pgdir, newsz, oldsz);
       kfree(mem);
       return 0;
@@ -252,6 +255,7 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
+// If the page was swapped free the corresponding disk block.
 int
 deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
@@ -264,8 +268,15 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
   a = PGROUNDUP(newsz);
   for(; a  < oldsz; a += PGSIZE){
     pte = walkpgdir(pgdir, (char*)a, 0);
+
     if(!pte)
       a = PGADDR(PDX(a) + 1, 0, 0) - PGSIZE;
+
+    else if(*pte & PTE_SWAPPED){
+        uint block_id= (*pte)>>12;
+        bfree_page(ROOTDEV,block_id);
+      }
+
     else if((*pte & PTE_P) != 0){
       pa = PTE_ADDR(*pte);
       if(pa == 0)
@@ -274,6 +285,7 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       kfree(v);
       *pte = 0;
     }
+
   }
   return newsz;
 }
@@ -295,6 +307,78 @@ freevm(pde_t *pgdir)
     }
   }
   kfree((char*)pgdir);
+}
+
+// Select a page-table entry which is mapped
+// but not accessed. Notice that the user memory
+// is mapped between 0...KERNBASE.
+
+/* ********xv7*************
+i) in the kmem.freelist, find a page whose access bit is not setting
+ii) if (i) is unable to find any such page, randomly reset access bit
+    of 10% of the allocated pages and call select_a_victim() again
+*/
+
+pte_t*
+select_a_victim(pde_t *pgdir)
+{
+  pte_t *pte;
+  for(long i=4096; i<KERNBASE;i+=PGSIZE){    //for all pages in the user virtual space
+  
+    if((pte=walkpgdir(pgdir,(char*)i,0))!= 0) //if mapping exists (0 as 3rd argument as we dont want to create mapping if does not exists)
+		  {    
+
+           if(*pte & PTE_P) //if not dirty, or (present and access bit not set)  --- conditions needs to be checked
+           {   if(*pte & ~PTE_A)             //access bit is NOT set.
+               {
+                 return pte;
+               }
+           }
+      }
+      else{
+
+        cprintf("walkpgdir failed \n ");
+      }
+	}
+
+  return 0;
+}
+
+// Clear access bit of a random pte.
+void
+clearaccessbit(pde_t *pgdir)
+{ pte_t *pte;
+  int count=0;
+  for(long i=4096;i<KERNBASE;i+=PGSIZE){
+      if((pte=walkpgdir(pgdir,(char*)i,0))!= 0){
+        cprintf("walkpkgdir mei");
+        if((*pte & PTE_P) & (*pte & PTE_A)){
+            *pte &= ~PTE_A;
+            count=count+1;
+            if(count<103){
+              cprintf("103 se kam hai");
+            }
+            else{
+              cprintf("103 se zyaada ho gya");
+            }
+        }
+    }
+  
+    if(count==103)   //10% of the 1024 pages cleared
+      return;
+  }
+}
+
+// return the disk block-id, if the virtual address
+// was swapped, -1 otherwise.
+int
+getswappedblk(pde_t *pgdir, uint va)
+{
+  //***************xv7**************
+  pte_t *pte= walkpgdir(pgdir,(char*)va,0);
+  //first 20 bits contain block-id, extract them from *pte
+  int block_id= (*pte)>>12;
+  return block_id;
 }
 
 // Clear PTE_U on a page. Used to create an inaccessible
@@ -319,24 +403,51 @@ copyuvm(pde_t *pgdir, uint sz)
   pte_t *pte;
   uint pa, i, flags;
   char *mem;
-
   if((d = setupkvm()) == 0)
     return 0;
+  // cprintf("process size is: %d",sz);
   for(i = 0; i < sz; i += PGSIZE){
+    // cprintf("i is :%d",i);
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
-    if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
+
+    if(*pte & PTE_SWAPPED){
+    //  *********************xv7******************
+    //cprintf("page was swapped\n");
+      if((mem = kalloc()) == 0)
+      {
+        swap_page(pgdir);
+        mem=kalloc();
+      }
+      int blockid=getswappedblk(pgdir,i);      //disk id where the page was swapped
+      read_page_from_disk(ROOTDEV,mem,blockid);
+
+      *pte=V2P(mem) | PTE_W | PTE_U | PTE_P;
+      *pte &= ~PTE_SWAPPED;
+      lcr3(V2P(pgdir));
+
+      bfree_page(ROOTDEV,blockid);
+
+      //panic("copyuvm: page not present");
+    }
+    //  cprintf("page was not swapped\n");
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    {
+    //  goto bad;
+    //swap a page to disk and kalloc
+      swap_page(pgdir);
+      mem=kalloc();
+      if(mem==0)
+        cprintf("unable to get memory in copyuvm");
     }
-  }
+
+    memmove(mem, (char*)P2V(pa), PGSIZE);
+    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0)
+      goto bad;
+}
+  //cprintf("exiting from copyuvm");
   return d;
 
 bad:
@@ -357,6 +468,14 @@ uva2ka(pde_t *pgdir, char *uva)
   if((*pte & PTE_U) == 0)
     return 0;
   return (char*)P2V(PTE_ADDR(*pte));
+}
+
+// returns the page table entry corresponding
+// to a virtual address.
+pte_t*
+uva2pte(pde_t *pgdir, uint uva)
+{
+  return walkpgdir(pgdir, (void*)uva, 0);
 }
 
 // Copy len bytes from p to user address va in page table pgdir.
@@ -391,4 +510,3 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
 // Blank page.
 //PAGEBREAK!
 // Blank page.
-

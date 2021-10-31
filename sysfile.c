@@ -15,6 +15,36 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "paging.h"
+#include "memlayout.h"
+
+extern int numallocblocks;
+
+// Return the address of the PTE in page table pgdir
+// that corresponds to virtual address va.  If alloc!=0,
+// create any required page table pages.
+static pte_t *
+walkpgdir(pde_t *pgdir, const void *va, int alloc)
+{
+  pde_t *pde;
+  pte_t *pgtab;
+
+  pde = &pgdir[PDX(va)];
+  if(*pde & PTE_P){
+    pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+  } else {
+    if(!alloc || (pgtab = (pte_t*)kalloc()) == 0)
+      return 0;
+    // Make sure all those PTE_P bits are zero.
+    memset(pgtab, 0, PGSIZE);
+    // The permissions here are overly generous, but they can
+    // be further restricted by the permissions in the page table
+    // entries, if necessary.
+    *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
+  }
+  return &pgtab[PTX(va)];
+}
+
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -165,7 +195,7 @@ bad:
 }
 
 // Is the directory dp empty except for "." and ".." ?
-static int
+int
 isdirempty(struct inode *dp)
 {
   int off;
@@ -238,9 +268,10 @@ bad:
   return -1;
 }
 
-static struct inode*
+struct inode*
 create(char *path, short type, short major, short minor)
 {
+  uint off;
   struct inode *ip, *dp;
   char name[DIRSIZ];
 
@@ -248,7 +279,7 @@ create(char *path, short type, short major, short minor)
     return 0;
   ilock(dp);
 
-  if((ip = dirlookup(dp, name, 0)) != 0){
+  if((ip = dirlookup(dp, name, &off)) != 0){
     iunlockput(dp);
     ilock(ip);
     if(type == T_FILE && ip->type == T_FILE)
@@ -374,7 +405,7 @@ sys_chdir(void)
   char *path;
   struct inode *ip;
   struct proc *curproc = myproc();
-  
+
   begin_op();
   if(argstr(0, &path) < 0 || (ip = namei(path)) == 0){
     end_op();
@@ -440,5 +471,36 @@ sys_pipe(void)
   }
   fd[0] = fd0;
   fd[1] = fd1;
+  return 0;
+}
+
+/* returns the number of swapped pages
+ */
+int
+sys_bstat(void)
+{
+  //************xv7************
+	return numallocblocks;
+}
+
+/* swap system call handler.
+ */
+
+ //*************xv7************
+int
+sys_swap(void)
+{
+  uint addr;
+
+  if(argint(0, (int*)&addr) < 0)
+    return -1;
+  // swap addr
+  struct proc *currentProcess=myproc();
+  pde_t *pgdir=currentProcess->pgdir;
+  pte_t *pte=walkpgdir(pgdir,(char*)addr,1);
+  if(*pte & PTE_P){
+    swap_page_from_pte(pte);
+  }
+
   return 0;
 }

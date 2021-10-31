@@ -6,11 +6,44 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "paging.h"
+
+#define NOMUTEX  50  
+#define NQUEUE   5  
+
+struct mutex {
+  int owner;  
+  int value;  
+  struct spinlock mlock; 
+};
 
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
 } ptable;
+
+struct {
+  struct spinlock lock;
+  int chanswapin;
+  int chanswapout;
+} swap;
+
+struct qnode {
+  struct proc *p;
+  struct qnode *next;
+  struct qnode *prev;
+};
+
+struct {
+  struct spinlock qlock;  
+  struct qnode *head;
+  struct qnode *tail;
+  int size;
+} queue[NQUEUE];
+
+struct qnode qnodes[NPROC];
+
+struct qnode *freenode;
 
 static struct proc *initproc;
 
@@ -38,10 +71,10 @@ struct cpu*
 mycpu(void)
 {
   int apicid, i;
-  
+
   if(readeflags()&FL_IF)
     panic("mycpu called with interrupts enabled\n");
-  
+
   apicid = lapicid();
   // APIC IDs are not guaranteed to be contiguous. Maybe we should have
   // a reverse map, or reserve a register to store &cpus[i].
@@ -88,7 +121,6 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
-  p->oldsz = 0;
 
   release(&ptable.lock);
 
@@ -125,7 +157,7 @@ userinit(void)
   extern char _binary_initcode_start[], _binary_initcode_size[];
 
   p = allocproc();
-  
+
   initproc = p;
   if((p->pgdir = setupkvm()) == 0)
     panic("userinit: out of memory?");
@@ -143,14 +175,8 @@ userinit(void)
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
 
-  // this assignment to p->state lets other cores
-  // run this process. the acquire forces the above
-  // writes to be visible, and the lock is also needed
-  // because the assignment might not be atomic.
   acquire(&ptable.lock);
-
   p->state = RUNNABLE;
-
   release(&ptable.lock);
 }
 
@@ -159,19 +185,11 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
   struct proc *curproc = myproc();
 
-  sz = curproc->sz;
-  if(n > 0){
-    if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
-      return -1;
-  } else if(n < 0){
-    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
-      return -1;
-  }
-  curproc->sz = sz;
-  switchuvm(curproc);
+  if (n < 0 || n > KERNBASE || curproc->sz + n > KERNBASE)
+	  return -1;
+  curproc->sz += n;
   return 0;
 }
 
@@ -181,6 +199,7 @@ growproc(int n)
 int
 fork(void)
 {
+  
   int i, pid;
   struct proc *np;
   struct proc *curproc = myproc();
@@ -212,13 +231,9 @@ fork(void)
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
   pid = np->pid;
-
   acquire(&ptable.lock);
-
   np->state = RUNNABLE;
-
   release(&ptable.lock);
-
   return pid;
 }
 
@@ -276,7 +291,9 @@ wait(void)
   struct proc *p;
   int havekids, pid;
   struct proc *curproc = myproc();
-  
+  pde_t *pgdir;
+
+
   acquire(&ptable.lock);
   for(;;){
     // Scan through table looking for exited children.
@@ -290,13 +307,15 @@ wait(void)
         pid = p->pid;
         kfree(p->kstack);
         p->kstack = 0;
-        freevm(p->pgdir);
+        pgdir = p->pgdir;
+        p->pgdir = 0;
         p->pid = 0;
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
         p->state = UNUSED;
         release(&ptable.lock);
+        freevm(pgdir);
         return pid;
       }
     }
@@ -326,7 +345,7 @@ scheduler(void)
   struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
-  
+
   for(;;){
     // Enable interrupts on this processor.
     sti();
@@ -419,7 +438,7 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
+
   if(p == 0)
     panic("sleep");
 
@@ -533,3 +552,226 @@ procdump(void)
     cprintf("\n");
   }
 }
+
+/*
+
+int
+mtx_create(int locked)
+{
+  int mtx_id;
+  mtx_id = 0;
+  // check if any more mutexes are available to be created.
+  if (freemtx >= NOMUTEX)
+    return -1;
+
+  // Initialize the spinlock so processes can use it.
+  initlock(&mutexes[mtx_id].mlock, "mutex");
+
+  mtx_id = freemtx;
+  freemtx++;
+
+  // Set lock state based on argument
+  acquire(&mutexes[mtx_id].mlock);
+  if(locked){
+    mutexes[mtx_id].owner = proc->pid;
+    mutexes[mtx_id].value = 1;
+  } else {
+    mutexes[mtx_id].owner = 0;
+    mutexes[mtx_id].value = 0;
+  }
+  release(&mutexes[mtx_id].mlock);
+
+  return mtx_id;
+}
+
+int
+mtx_lock(int lock_id)
+{
+  void *chan;
+  chan = 0;
+  // make sure a mutex was allocated before allowing a lock request to be made.
+  if (lock_id >= freemtx || lock_id < 0)
+    return -1;
+  chan = (void*)(mutexes + lock_id);
+  acquire(&(mutexes[lock_id].mlock));
+
+  // sleep until a lock is acquired on the mutex
+  while (mutexes[lock_id].value > 0 && mutexes[lock_id].owner != proc->pid) {
+    sleep(chan, &(mutexes[lock_id].mlock));
+  }
+
+  // after the lock has been acquired
+  mutexes[lock_id].owner = proc->pid;
+  mutexes[lock_id].value = 1;
+  release(&(mutexes[lock_id].mlock));
+  return 0;
+}
+
+int
+mtx_unlock(int lock_id)
+{
+  void *chan;
+  chan = 0;
+  // check lock_id is valid and if proc owns mutex
+  if (lock_id >= freemtx || lock_id < 0)
+    return -1;
+  if (mutexes[lock_id].owner != proc->pid)
+    return -1;
+
+  chan = (void*)(mutexes + lock_id);
+  acquire(&(mutexes[lock_id].mlock));
+  mutexes[lock_id].value = 0;
+  mutexes[lock_id].owner = -1;
+  release(&(mutexes[lock_id].mlock));
+  wakeup(chan);
+  return 0;
+}
+
+void
+_queue_remove(struct qnode *qn)
+{
+  int priority;
+  priority = qn->p->priority;
+  if (queue[priority].size == 1){
+    queue[priority].head = 0;
+    queue[priority].tail = 0;
+  } else if (queue[priority].head == qn) {
+    qn->next->prev = 0;
+    queue[priority].head = qn->next;
+  } else if (queue[priority].tail == qn) {
+    qn->prev->next = 0;
+    queue[priority].tail = qn->prev;
+  } else {
+    qn->prev->next = qn->next;
+    qn->next = qn->prev;
+  }
+  queue[priority].size--;
+}
+
+void
+_queue_add(struct qnode *qn)
+{
+  int priority;
+  priority = qn->p->priority;
+  if (queue[priority].size == 0){
+    queue[priority].head = qn;
+    queue[priority].tail = qn;
+  } else {
+    queue[priority].tail->next = qn;
+    qn->prev = queue[priority].tail;
+    qn->next = 0;
+    queue[priority].tail = qn;
+  }
+  queue[priority].size++;
+}
+*/
+
+
+/* 
+Pseudo code, written in old_swap.c
+
+void
+swapout(void){
+
+  release(&ptable.lock);
+  cprintf("The swapout swapper has been loaded.\n");
+  for(;;){
+    acquire(&swap.lock);
+    sleep(&swap.chanswapout, &swap.lock);
+   
+    // Find the least recently used page.
+    // Save contents of that page to a file.
+    // Take the memory and put it on kmem.freelist ??? (in kalloc.c)
+    // Get the process to run kalloc again???? (by moving program counter back 
+    // so that it executes kalloc).
+    
+    release(&swap.lock);
+  }
+}
+
+void
+swapin(void){
+  
+  release(&ptable.lock);
+  cprintf("The swapin swapper has been loaded.\n");
+  for(;;){
+    acquire(&swap.lock);
+    sleep(&swap.chanswapin, &swap.lock);
+   
+    // get page table lock.
+    // Find the place to put the page in the page table.
+    // Load contents of page from file into page table.
+    // release page table lock.
+    // delete the file from disk.
+    
+    release(&swap.lock);
+  }
+}
+
+*/
+
+void
+create_kernel_process(const char *name, void (*entrypoint)()){
+  struct proc *np;
+  struct qnode *qn;
+  
+  if ((np = allocproc()) == 0) panic("Failing allocating kernel process");
+  
+  qn = freenode;
+  freenode = freenode->next;
+
+  if(freenode != 0) {
+    freenode->prev = 0;
+  }
+  
+  if((np->pgdir = setupkvm()) == 0){
+    kfree(np->kstack);
+    np->kstack = 0;
+    np->state = UNUSED;
+    panic("Failed setup pgdir for kernel process");
+  }
+  
+  np->sz = PGSIZE;
+  np->parent = initproc; 
+  memset(np->tf, 0, sizeof(*np->tf));
+  np->tf->cs = (SEG_UCODE << 3) | DPL_USER;
+  np->tf->ds = (SEG_UDATA << 3) | DPL_USER;
+  np->tf->es = np->tf->ds;
+  np->tf->ss = np->tf->ds;
+  np->tf->eflags = FL_IF;
+  np->tf->esp = PGSIZE;
+
+  // beginning of initcode.S
+  np->tf->eip = 0;              
+  
+  // Set eax = 0 so that fork return 0 in the child
+  np->tf->eax = 0;
+  np->cwd = namei("/");
+  safestrcpy(np->name, name, sizeof(name));
+  qn->p = np;
+
+  // lock to force the compiler to emit the np-state write last.
+  acquire(&ptable.lock);
+  np->context->eip = (uint)entrypoint;
+  np->state = RUNNABLE;
+  release(&ptable.lock);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

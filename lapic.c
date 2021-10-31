@@ -99,7 +99,21 @@ lapicinit(void)
 
 int
 lapicid(void)
-{
+{ 
+  
+  // Cannot call cpu when interrupts are enabled:
+  // result not guaranteed to last long enough to be used!
+  // Would prefer to panic but even printing is chancy here:
+  // almost everything, including cprintf and panic, calls cpu,
+  // often indirectly through acquire and release.
+  if(readeflags()&FL_IF){
+    static int n;
+    if(n++ == 0)
+      cprintf("cpu called from %x with interrupts enabled\n",
+        __builtin_return_address(0));
+  }
+  
+  
   if (!lapic)
     return 0;
   return lapic[ID] >> 24;
@@ -171,8 +185,7 @@ lapicstartap(uchar apicid, uint addr)
 #define MONTH   0x08
 #define YEAR    0x09
 
-static uint
-cmos_read(uint reg)
+static uint cmos_read(uint reg)
 {
   outb(CMOS_PORT,  reg);
   microdelay(200);
@@ -180,8 +193,7 @@ cmos_read(uint reg)
   return inb(CMOS_RETURN);
 }
 
-static void
-fill_rtcdate(struct rtcdate *r)
+static void fill_rtcdate(struct rtcdate *r)
 {
   r->second = cmos_read(SECS);
   r->minute = cmos_read(MINS);
@@ -192,8 +204,7 @@ fill_rtcdate(struct rtcdate *r)
 }
 
 // qemu seems to use 24-hour GWT and the values are BCD encoded
-void
-cmostime(struct rtcdate *r)
+void cmostime(struct rtcdate *r)
 {
   struct rtcdate t1, t2;
   int sb, bcd;

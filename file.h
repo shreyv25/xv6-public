@@ -8,7 +8,6 @@ struct file {
   uint off;
 };
 
-
 // in-memory copy of an inode
 struct inode {
   uint dev;           // Device number
@@ -16,7 +15,8 @@ struct inode {
   int ref;            // Reference count
   struct sleeplock lock; // protects everything below here
   int valid;          // inode has been read from disk?
-
+  // **** changes ****
+  int flags;          // I_BUSY, I_VALID
   short type;         // copy of disk inode
   short major;
   short minor;
@@ -24,6 +24,10 @@ struct inode {
   uint size;
   uint addrs[NDIRECT+1];
 };
+
+// Changes 
+#define I_BUSY 0x1	
+#define I_VALID 0x2	
 
 // table mapping major device number to
 // device functions
@@ -33,5 +37,4 @@ struct devsw {
 };
 
 extern struct devsw devsw[];
-
 #define CONSOLE 1
